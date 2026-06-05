@@ -18,6 +18,7 @@ import {
   savePendingExtraction,
   takePendingExtraction,
 } from '@/services/cache.service';
+import { getUserLang, setUserLang } from '@/services/lang.service';
 import {
   formatAnalysisForTelegram,
   formatRateLimitMessage,
@@ -26,41 +27,73 @@ import {
   formatWelcomeMessage,
   formatHelpMessage,
 } from '@/utils/format';
-import { DISCLAIMER } from '@/config/constants';
+import { t, LANGUAGE_PROMPT } from '@/config/i18n';
+import { LANGUAGES, SUPPORTED_LANGS, isLangCode, type LangCode } from '@/config/languages';
 import type { VisionExtraction } from '@/types';
 
 /**
- * Map of purpose button callback codes -> human-readable purpose text.
- * Keep these short and broadly useful. "type" and "skip" are special.
+ * Purpose buttons. `code` is stable, `purpose` is the English phrase sent to the
+ * awareness model (it understands English and generates the reply in the user's
+ * language). The button LABEL the user sees comes from the i18n table by code.
  */
-const PURPOSE_OPTIONS: { code: string; label: string; purpose: string | null }[] = [
-  { code: 'skin', label: '🧴 Skin / pigmentation', purpose: 'skin pigmentation or melasma' },
-  { code: 'bleeding', label: '🩸 Bleeding / periods', purpose: 'bleeding or heavy periods' },
-  { code: 'pain', label: '💢 Pain / fever', purpose: 'pain or fever' },
-  { code: 'infection', label: '🦠 Infection', purpose: 'an infection' },
-  { code: 'bp', label: '❤️ BP / heart', purpose: 'blood pressure or heart condition' },
-  { code: 'sugar', label: '🩺 Diabetes / sugar', purpose: 'diabetes or blood sugar' },
-  { code: 'acidity', label: '🔥 Acidity / stomach', purpose: 'acidity or stomach issues' },
-  { code: 'allergy', label: '🤧 Allergy / cold', purpose: 'allergy or cold' },
+const PURPOSE_OPTIONS: { code: string; purpose: string }[] = [
+  { code: 'skin', purpose: 'skin pigmentation or melasma' },
+  { code: 'bleeding', purpose: 'bleeding or heavy periods' },
+  { code: 'pain', purpose: 'pain or fever' },
+  { code: 'infection', purpose: 'an infection' },
+  { code: 'bp', purpose: 'blood pressure or heart condition' },
+  { code: 'sugar', purpose: 'diabetes or blood sugar' },
+  { code: 'acidity', purpose: 'acidity or stomach issues' },
+  { code: 'allergy', purpose: 'allergy or cold' },
 ];
 
+/* ------------------------------ Language picker ----------------------------- */
+
+/** Inline keyboard offering every supported language (button = native name). */
+function languageKeyboard(): TelegramBot.InlineKeyboardButton[][] {
+  return [
+    SUPPORTED_LANGS.map((code) => ({
+      text: LANGUAGES[code].nativeName,
+      callback_data: `lang:${code}`,
+    })),
+  ];
+}
+
+/** Ask the user which language they are comfortable in (shown on /start, /language). */
+async function askLanguage(chatId: number): Promise<void> {
+  await sendMessageWithRetry(chatId, LANGUAGE_PROMPT, {
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: languageKeyboard() },
+  });
+}
+
 /**
- * Wire up all Telegram event handlers. Idempotent — safe to call once at startup.
+ * Wire up all Telegram event handlers. Idempotent — call once at startup.
  */
 export function registerHandlers(): void {
-  // /start
+  // /start -> ask language first, so everything afterwards is in that language
   bot.onText(/^\/start(?:@\w+)?$/, async (msg) => {
     try {
-      await sendMarkdownMessage(msg.chat.id, formatWelcomeMessage());
+      await askLanguage(msg.chat.id);
     } catch (err) {
       logger.error({ err: (err as Error).message }, '/start handler failed');
+    }
+  });
+
+  // /language -> change language anytime
+  bot.onText(/^\/language(?:@\w+)?$/, async (msg) => {
+    try {
+      await askLanguage(msg.chat.id);
+    } catch (err) {
+      logger.error({ err: (err as Error).message }, '/language handler failed');
     }
   });
 
   // /help
   bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     try {
-      await sendMarkdownMessage(msg.chat.id, formatHelpMessage());
+      const lang = await getUserLang(msg.chat.id);
+      await sendMarkdownMessage(msg.chat.id, formatHelpMessage(lang));
     } catch (err) {
       logger.error({ err: (err as Error).message }, '/help handler failed');
     }
@@ -70,12 +103,12 @@ export function registerHandlers(): void {
   bot.onText(/^\/usage(?:@\w+)?$/, async (msg) => {
     if (!msg.from) return;
     try {
+      const lang = await getUserLang(msg.chat.id);
       const usage = await getCurrentUsage(msg.from.id);
-      const text =
-        `📊 *Today's usage:* ${usage.used} of ${usage.limit} scans used\n` +
-        `Remaining: *${usage.remaining}*\n\n` +
-        DISCLAIMER;
-      await sendMarkdownMessage(msg.chat.id, text);
+      await sendMarkdownMessage(
+        msg.chat.id,
+        t(lang).usage(usage.used, usage.limit, usage.remaining)
+      );
     } catch (err) {
       logger.error({ err: (err as Error).message }, '/usage handler failed');
     }
@@ -101,14 +134,14 @@ export function registerHandlers(): void {
     });
   });
 
-  // Inline button taps (purpose selection)
+  // Inline button taps (language selection OR purpose selection)
   bot.on('callback_query', (q) => {
     handleCallbackQuery(q).catch((err) => {
       logger.error({ err: (err as Error).message }, 'callback handler crashed');
     });
   });
 
-  // Text messages: could be a typed purpose (if mid-flow) or unrelated text
+  // Text messages: a typed purpose (if mid-flow) or unrelated text
   bot.on('message', (msg) => {
     handleTextMessage(msg).catch((err) => {
       logger.error({ err: (err as Error).message }, 'text handler crashed');
@@ -135,12 +168,10 @@ async function handlePhotoMessage(msg: TelegramBot.Message): Promise<void> {
 
 async function handleDocumentMessage(msg: TelegramBot.Message): Promise<void> {
   if (!msg.from || !msg.document) return;
+  const lang = await getUserLang(msg.chat.id);
   const mime = msg.document.mime_type ?? '';
   if (!mime.startsWith('image/')) {
-    await sendMarkdownMessage(
-      msg.chat.id,
-      `Please send an *image* of your medicine label.\n\n${DISCLAIMER}`
-    );
+    await sendMarkdownMessage(msg.chat.id, t(lang).sendImage);
     return;
   }
   const log = withReqId(genReqId(), { chatId: msg.chat.id, userId: msg.from.id });
@@ -166,6 +197,7 @@ async function processImage(args: {
 }): Promise<void> {
   const { chatId, telegramUserId, fileId, reqLogger } = args;
 
+  const lang = await getUserLang(chatId);
   await sendTypingAction(chatId);
 
   let imageBuffer: Buffer;
@@ -173,10 +205,7 @@ async function processImage(args: {
     imageBuffer = await downloadFile(fileId, env.MAX_IMAGE_BYTES);
   } catch (err) {
     reqLogger.warn({ err: (err as Error).message }, 'Failed to download user image');
-    await sendMarkdownMessage(
-      chatId,
-      `❌ Couldn't download the image. Please try sending it again.\n\n${DISCLAIMER}`
-    );
+    await sendMarkdownMessage(chatId, t(lang).downloadFailed);
     return;
   }
 
@@ -184,15 +213,14 @@ async function processImage(args: {
 
   switch (result.kind) {
     case 'extracted': {
-      // Save the extraction and ask the purpose question.
       await savePendingExtraction(chatId, result.extraction);
-      await askPurpose(chatId, result.extraction);
+      await askPurpose(chatId, result.extraction, lang);
       break;
     }
     case 'rate_limited':
       await sendMarkdownMessage(
         chatId,
-        formatRateLimitMessage(result.resetAt, env.FREE_DAILY_SCAN_LIMIT)
+        formatRateLimitMessage(result.resetAt, env.FREE_DAILY_SCAN_LIMIT, lang)
       );
       break;
     case 'low_confidence':
@@ -200,23 +228,17 @@ async function processImage(args: {
         { reason: result.reason, readConfidence: result.readConfidence },
         'Low confidence - asked for clearer photo'
       );
-      await sendMarkdownMessage(chatId, formatLowConfidenceMessage(result.reason));
+      await sendMarkdownMessage(chatId, formatLowConfidenceMessage(result.reason, lang));
       break;
     case 'not_a_medicine':
-      await sendMarkdownMessage(chatId, formatNotAMedicineMessage());
+      await sendMarkdownMessage(chatId, formatNotAMedicineMessage(lang));
       break;
     case 'extraction_failed':
-      await sendMarkdownMessage(
-        chatId,
-        `❌ Couldn't read the image. Please try a clearer photo.\n\n${DISCLAIMER}`
-      );
+      await sendMarkdownMessage(chatId, t(lang).extractionFailed);
       break;
     case 'image_too_large': {
       const mb = (result.maxBytes / (1024 * 1024)).toFixed(0);
-      await sendMarkdownMessage(
-        chatId,
-        `📦 Image is too large. Please send an image under ${mb} MB.\n\n${DISCLAIMER}`
-      );
+      await sendMarkdownMessage(chatId, t(lang).imageTooLarge(mb));
       break;
     }
   }
@@ -227,33 +249,35 @@ async function processImage(args: {
 /**
  * Ask the user what they are taking the medicine for, with tappable buttons.
  * Knowing the purpose lets us tailor the response so a correctly-prescribed
- * patient isn't alarmed by an unrelated primary use.
+ * patient isn't alarmed by an unrelated primary use. Labels come from i18n.
  */
-async function askPurpose(chatId: number, extraction: VisionExtraction): Promise<void> {
+async function askPurpose(
+  chatId: number,
+  extraction: VisionExtraction,
+  lang: LangCode
+): Promise<void> {
+  const L = t(lang);
   const ingredients = extraction.activeIngredients
     .map((i) => (i.strength ? `${i.name} ${i.strength}` : i.name))
     .join(', ');
 
-  // Build a 2-per-row inline keyboard from PURPOSE_OPTIONS, plus type/skip.
   const rows: TelegramBot.InlineKeyboardButton[][] = [];
   for (let i = 0; i < PURPOSE_OPTIONS.length; i += 2) {
     rows.push(
       PURPOSE_OPTIONS.slice(i, i + 2).map((o) => ({
-        text: o.label,
+        text: L.purposeLabels[o.code] ?? o.code,
         callback_data: `purpose:${o.code}`,
       }))
     );
   }
   rows.push([
-    { text: '✍️ Type my reason', callback_data: 'purpose:type' },
-    { text: '⏭️ Skip', callback_data: 'purpose:skip' },
+    { text: L.typeLabel, callback_data: 'purpose:type' },
+    { text: L.skipLabel, callback_data: 'purpose:skip' },
   ]);
 
   await sendMessageWithRetry(
     chatId,
-    `✅ I read: *${escapeMd(extraction.medicineName)}*\n` +
-      (ingredients ? `Ingredient: ${escapeMd(ingredients)}\n\n` : '\n') +
-      `To give you the *right* information, what are you using this for?`,
+    L.purposeQuestion(extraction.medicineName, ingredients),
     { parse_mode: 'Markdown', reply_markup: { inline_keyboard: rows } }
   );
 }
@@ -262,12 +286,12 @@ async function askPurpose(chatId: number, extraction: VisionExtraction): Promise
 
 async function handleCallbackQuery(q: TelegramBot.CallbackQuery): Promise<void> {
   const chatId = q.message?.chat.id;
-  if (!chatId || !q.data || !q.data.startsWith('purpose:')) return;
+  if (!chatId || !q.data) return;
 
-  // Always acknowledge the tap so Telegram stops the loading spinner.
+  // Acknowledge the tap so Telegram stops the loading spinner.
   await bot.answerCallbackQuery(q.id).catch(() => {});
 
-  // Remove the buttons immediately so a second tap can't double-fire.
+  // Remove the buttons so a second tap can't double-fire.
   if (q.message) {
     await bot
       .editMessageReplyMarkup(
@@ -277,32 +301,36 @@ async function handleCallbackQuery(q: TelegramBot.CallbackQuery): Promise<void> 
       .catch(() => {});
   }
 
+  // ---- Language selection ----
+  if (q.data.startsWith('lang:')) {
+    const code = q.data.split(':')[1];
+    if (!isLangCode(code)) return;
+    await setUserLang(chatId, code);
+    // Greet the user in the language they just picked.
+    await sendMarkdownMessage(chatId, formatWelcomeMessage(code));
+    return;
+  }
+
+  // ---- Purpose selection ----
+  if (!q.data.startsWith('purpose:')) return;
+  const lang = await getUserLang(chatId);
   const code = q.data.split(':')[1];
 
   if (code === 'type') {
-    await sendMessageWithRetry(
-      chatId,
-      `Please type what you are using it for (e.g. "for skin marks", "for periods").`
-    );
-    // The pending extraction stays in Redis; handleTextMessage will pick it up.
+    await sendMarkdownMessage(chatId, t(lang).purposeTypePrompt);
+    // The pending extraction stays in Redis; handleTextMessage picks it up.
     return;
   }
 
   const extraction = await takePendingExtraction(chatId);
-  if (!extraction) {
-    // await sendMessageWithRetry(
-    //   chatId,
-    //   `That request expired. Please send the medicine photo again.`
-    // );
-    return;
-  }
+  if (!extraction) return;
 
   let purpose: string | null = null;
   if (code !== 'skip') {
     purpose = PURPOSE_OPTIONS.find((o) => o.code === code)?.purpose ?? null;
   }
 
-  await runAwarenessAndReply(chatId, extraction, purpose);
+  await runAwarenessAndReply(chatId, extraction, purpose, lang);
 }
 
 /* ------------------------------- Text handler -------------------------------- */
@@ -310,31 +338,30 @@ async function handleCallbackQuery(q: TelegramBot.CallbackQuery): Promise<void> 
 async function handleTextMessage(msg: TelegramBot.Message): Promise<void> {
   if (!msg.text || msg.text.startsWith('/')) return; // commands handled elsewhere
   const chatId = msg.chat.id;
+  const lang = await getUserLang(chatId);
 
   // If the user has a pending extraction, treat their text as the purpose.
   const extraction = await takePendingExtraction(chatId);
   if (extraction) {
-    await runAwarenessAndReply(chatId, extraction, msg.text.trim());
+    await runAwarenessAndReply(chatId, extraction, msg.text.trim(), lang);
     return;
   }
 
   // Otherwise, gently guide them to send a photo.
-  await sendMarkdownMessage(
-    chatId,
-    `Please send a *photo* of your medicine label.\n\nUse /help for instructions.\n\n${DISCLAIMER}`
-  );
+  await sendMarkdownMessage(chatId, t(lang).sendPhoto);
 }
 
 /* ------------------------------ Shared awareness ----------------------------- */
 
 /**
- * Generate the (purpose-tailored) awareness response and send it.
- * Quota was already consumed at extraction time, so this is free to the user.
+ * Generate the (purpose-tailored) awareness response in the user's language and
+ * send it. Quota was already consumed at extraction time, so this is free.
  */
 async function runAwarenessAndReply(
   chatId: number,
   extraction: VisionExtraction,
-  purpose: string | null
+  purpose: string | null,
+  lang: LangCode
 ): Promise<void> {
   await sendTypingAction(chatId);
   const log = withReqId(genReqId(), { chatId });
@@ -342,21 +369,14 @@ async function runAwarenessAndReply(
   const analysis = await generateAwarenessForExtraction({
     extraction,
     purpose,
+    lang,
     reqLogger: log,
   });
 
   if (!analysis) {
-    await sendMarkdownMessage(
-      chatId,
-      `❌ Something went wrong preparing the information. Please send the photo again.\n\n${DISCLAIMER}`
-    );
+    await sendMarkdownMessage(chatId, t(lang).somethingWrong);
     return;
   }
 
-  await sendMarkdownMessage(chatId, formatAnalysisForTelegram(analysis));
-}
-
-/** Minimal Markdown escaping for inline values. */
-function escapeMd(text: string): string {
-  return text.replace(/([*_`\[\]])/g, '\\$1');
+  await sendMarkdownMessage(chatId, formatAnalysisForTelegram(analysis, lang));
 }

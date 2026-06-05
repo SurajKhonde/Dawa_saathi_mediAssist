@@ -2,9 +2,10 @@ import Anthropic from '@anthropic-ai/sdk';
 import { env } from '@/config/env';
 import { logger } from '@/config/logger';
 import {
-  AWARENESS_SYSTEM_PROMPT,
+  buildAwarenessSystemPrompt,
   buildAwarenessUserMessage,
 } from '@/prompts/awareness.prompt';
+import { DEFAULT_LANG, type LangCode } from '@/config/languages';
 import type { FdaEnrichment, MedicineAnalysis, VisionExtraction } from '@/types';
 import { retry } from '@/utils/async';
 
@@ -21,8 +22,9 @@ export async function generateAwareness(args: {
   extraction: VisionExtraction;
   fda: FdaEnrichment | null;
   purpose?: string | null;
+  lang?: LangCode;
 }): Promise<MedicineAnalysis> {
-  const { extraction, fda, purpose } = args;
+  const { extraction, fda, purpose, lang = DEFAULT_LANG } = args;
 
   const userMessage = buildAwarenessUserMessage({
     medicineName: extraction.medicineName,
@@ -36,7 +38,7 @@ export async function generateAwareness(args: {
       client.messages.create({
         model: env.CLAUDE_MODEL,
         max_tokens: 2000,
-        system: AWARENESS_SYSTEM_PROMPT,
+        system: buildAwarenessSystemPrompt(lang),
         messages: [{ role: 'user', content: userMessage }],
       }),
     {

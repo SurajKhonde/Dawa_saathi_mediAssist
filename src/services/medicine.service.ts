@@ -1,5 +1,6 @@
 import { env } from '@/config/env';
 import { logger, type Logger } from '@/config/logger';
+import { DEFAULT_LANG, type LangCode } from '@/config/languages';
 import type { PipelineResult, MedicineAnalysis, VisionExtraction } from '@/types';
 import { ingredientKey } from '@/utils/normalize';
 import { extractMedicineFromImage } from './vision.service';
@@ -155,16 +156,18 @@ export async function runMedicinePipeline(args: {
 export async function generateAwarenessForExtraction(args: {
   extraction: VisionExtraction;
   purpose: string | null;
+  lang?: LangCode;
   reqLogger?: Logger;
 }): Promise<MedicineAnalysis | null> {
-  const { extraction, purpose, reqLogger = logger } = args;
+  const { extraction, purpose, lang = DEFAULT_LANG, reqLogger = logger } = args;
 
-  // Cache key includes purpose so "skin" vs "bleeding" get different cached answers.
+  // Cache key includes purpose AND language, so "skin" vs "bleeding" and
+  // English vs Kannada each get their own cached answer.
   const baseKey = ingredientKey(extraction.activeIngredients);
   const purposeTag = purpose
     ? purpose.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24)
     : 'none';
-  const key = `${baseKey}:${purposeTag}`;
+  const key = `${baseKey}:${purposeTag}:${lang}`;
 
   // Cache lookup
   const cached = await lookupCachedMedicine(key).catch(() => null);
@@ -186,7 +189,7 @@ export async function generateAwarenessForExtraction(args: {
   // Awareness generation
   let analysis: MedicineAnalysis;
   try {
-    analysis = await generateAwareness({ extraction, fda, purpose });
+    analysis = await generateAwareness({ extraction, fda, purpose, lang });
   } catch (err) {
     reqLogger.error({ err: (err as Error).message }, 'Awareness generation failed');
     return null;

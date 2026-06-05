@@ -1,5 +1,17 @@
 # Dawa Saathi — Medicine Awareness Bot
 
+
+## 🌐 Multilingual support (English + ಕನ್ನಡ)
+
+On `/start` the bot asks the user to pick a language; the choice is stored per-user in Redis and used for every reply. Switch anytime with `/language`.
+
+Two layers keep this fast and faithful:
+
+- **Static UI** (buttons, section labels, errors, disclaimer) lives in a small i18n table (`src/config/i18n.ts`) — instant and zero token cost. The medical disclaimer is reviewed per language.
+- **The medicine response itself is LLM-generated directly in the user's language** — the awareness model writes the values in the target language while JSON keys stay English and drug names stay in Latin script. No brittle dictionary, nothing dropped, and only one model call. Each language is cached separately (`ingredients:purpose:lang`).
+
+Adding a language (Hindi, Marathi, ...) is two edits: a `LangCode` entry in `src/config/languages.ts` and a strings block in `src/config/i18n.ts`.
+
 A Telegram bot that helps people **understand medicine labels** in simple, elder-friendly language. Send a photo of a medicine strip; the bot reads it, asks what you're taking it for, then explains common uses, side effects, and warnings — tailored to your reason.
 
 **This bot does NOT diagnose, prescribe, or recommend dosages. Every response ends with a disclaimer to consult a qualified doctor.**
